@@ -1,0 +1,39 @@
+{
+  "products": [
+    {
+      "name": "Sony WH-1000XM5 Headphones",
+      "url": "https://www.amazon.com/dp/B09XS7JWHH",
+      "threshold": 299.99
+    },
+    {
+      "name": "Kindle Paperwhite",
+      "url": "https://www.amazon.com/dp/B09TMF6742",
+      "threshold": 99.99
+    },
+    {
+      "name": "Anker PowerCore 10000",
+      "url": "https://www.amazon.com/dp/B0194WDVHI",
+      "threshold": 25.00
+    },
+    {
+      "name": "Logitech MX Master 3S Mouse",
+      "url": "https://www.amazon.com/dp/B09HM94VDS",
+      "threshold": 79.99
+    },
+    {
+      "name": "Echo Dot (5th Gen)",
+      "url": "https://www.amazon.com/dp/B09B8YWXDF",
+      "threshold": 29.99
+    }
+  ],
+  "email": {
+    "smtp_server": "smtp.gmail.com",
+    "smtp_port": 587,
+    "sender_email": "your_email@gmail.com",
+    "recipients": [
+      "alert_recipient@gmail.com"
+    ]
+  },
+  "check_interval_hours": 24,
+  "output_csv": "price_history.csv"
+}
