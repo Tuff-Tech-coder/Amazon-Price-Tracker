@@ -19,19 +19,19 @@ Setup:
     3. Run: python price_tracker.py
 """
 
-import os
-import re
-import csv
-import json
-import time
-import random
-import logging
-import smtplib
 import argparse
+import csv
 import datetime
-from pathlib import Path
-from email.mime.text import MIMEText
+import json
+import logging
+import os
+import random
+import re
+import smtplib
+import time
 from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
@@ -132,7 +132,7 @@ def load_config(path: Path = CONFIG_FILE) -> dict:
     """Load and validate the JSON configuration file."""
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
-    with open(path, "r") as f:
+    with open(path) as f:
         config = json.load(f)
     required_keys = ["products", "email", "output_csv"]
     for key in required_keys:
@@ -327,12 +327,12 @@ def run_check(config: dict, demo: bool = False) -> None:
         if result["error"]:
             logger.error(f"  Error: {result['error']}")
         elif price is None:
-            logger.warning(f"  Could not parse price from page")
+            logger.warning("  Could not parse price from page")
         else:
             logger.info(f"  Price: ${price:.2f} (threshold: ${threshold:.2f})")
             if price < threshold:
                 alert_triggered = True
-                logger.info(f"  *** ALERT: Price dropped below threshold! ***")
+                logger.info("  *** ALERT: Price dropped below threshold! ***")
                 alerts.append({**result, "threshold": threshold})
 
         records.append({
