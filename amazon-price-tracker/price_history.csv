@@ -1,6 +1,0 @@
-timestamp,name,price,threshold,alert_triggered,url,error
-2026-05-13T14:16:15,Sony WH-1000XM5 Headphones,290.31,299.99,True,https://www.amazon.com/dp/B09XS7JWHH,
-2026-05-13T14:16:15,Kindle Paperwhite,89.02,99.99,True,https://www.amazon.com/dp/B09TMF6742,
-2026-05-13T14:16:15,Anker PowerCore 10000,21.23,25.0,True,https://www.amazon.com/dp/B0194WDVHI,
-2026-05-13T14:16:15,Logitech MX Master 3S Mouse,75.56,79.99,True,https://www.amazon.com/dp/B09HM94VDS,
-2026-05-13T14:16:15,Echo Dot (5th Gen),30.0,29.99,False,https://www.amazon.com/dp/B09B8YWXDF,
