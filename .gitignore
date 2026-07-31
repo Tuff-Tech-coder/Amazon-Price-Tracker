@@ -1,0 +1,31 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets & credentials  -- never commit these
+.env
+credentials.json
+token.json
+service_account*.json
+
+# Generated output & logs
+*.log
+merged_master.xlsx
+price_history.csv
+report.html
+*_live.xlsx
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
