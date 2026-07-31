@@ -1,105 +1,96 @@
 # Amazon Price Tracker
 
-![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
-![requests](https://img.shields.io/badge/requests-2.x-2C5BB4)
-![BeautifulSoup](https://img.shields.io/badge/BeautifulSoup-4.x-43B02A)
+![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-15%20passing-brightgreen)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
-A scheduled price-monitoring tool that tracks a configurable list of Amazon products, logs every check to a timestamped CSV for trend analysis, and sends formatted HTML email alerts the moment a price drops below your target.
+A scheduled monitoring service that tracks a configurable watchlist of products, logs every check to a timestamped CSV for trend analysis, and sends a formatted HTML email the moment a price drops below target.
 
-Built to be **safe to run unattended**: credentials live in environment variables, requests are throttled and retried, and a full demo mode lets you evaluate the tool without making a single live request.
-
----
-
-## Why it's useful
-
-Manually refreshing product pages to catch a price drop doesn't scale. This script turns that chore into a hands-off pipeline: set your products and target prices once, schedule it, and get an email only when it's time to buy. The CSV history doubles as a dataset for spotting pricing trends over time.
-
----
-
-## Features
-
-- **Live price scraping** from Amazon product pages via `requests` + `BeautifulSoup`, with a fallback chain of price selectors (handles standard listings, deals, and screen-reader prices).
-- **HTML email alerts** over SMTP, styled as a clean table linking straight back to each product.
-- **CSV history logging** — every check is appended with a timestamp, price, threshold, and whether an alert fired, ready for analysis in Excel or pandas.
-- **Anti-blocking measures** — rotating User-Agent header pool, randomized 2–5s delays, and retry logic with backoff on HTTP/connection/timeout errors.
-- **Three run modes** — run once, `--schedule` to loop on a configurable interval, or `--demo` to simulate prices with no network calls.
-- **Zero hardcoded secrets** — the SMTP password is read from the `SMTP_PASSWORD` environment variable; everything else lives in `config.json`.
-
----
-
-## Tech stack
-
-`Python` · `requests` · `BeautifulSoup` · `lxml` · `smtplib` (SMTP/TLS) · `csv` · `argparse` · `logging`
-
----
-
-## Project structure
-
-```
-amazon-price-tracker/
-├── price_tracker.py     # Main script
-├── config.json          # Product URLs, thresholds, email + interval settings
-├── requirements.txt     # Python dependencies
-├── .env.example         # Environment variable template (SMTP password)
-├── price_history.csv    # Generated: timestamped price log
-└── tracker.log          # Generated: application log
-```
-
----
-
-## Setup
+Built as a study in **unattended, long-running jobs**: credentials in environment variables, throttled and retried requests, structured logging, and an offline demo mode that exercises the entire pipeline — parse, threshold, log, alert — without a single network call.
 
 ```bash
-python -m venv venv
-source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-
-cp .env.example .env              # then add your Gmail App Password
+python price_tracker.py --demo      # full pipeline, zero network calls
 ```
 
-Edit `config.json` to add your products and target prices:
+---
 
-```json
-{
-  "products": [
-    { "name": "Sony WH-1000XM5", "url": "https://www.amazon.com/dp/B09XS7JWHH", "threshold": 299.99 }
-  ],
-  "email": {
-    "smtp_server": "smtp.gmail.com",
-    "smtp_port": 587,
-    "sender_email": "you@gmail.com",
-    "recipients": ["alerts@gmail.com"]
-  },
-  "check_interval_hours": 24,
-  "output_csv": "price_history.csv"
-}
-```
+## ⚖️ Responsible use
 
-> **Gmail note:** use an [App Password](https://myaccount.google.com/apppasswords), not your account password.
+Amazon's Conditions of Use prohibit automated data collection, and `robots.txt` disallows product-page crawling. **This project ships with `--demo` as its intended evaluation path**, which simulates prices locally.
+
+If you want live price data, use a sanctioned source instead — the [Amazon Product Advertising API](https://webservices.amazon.com/paapi5/documentation/) (free with an Associates account) or a licensed pricing-data provider. The scraping path is retained as a reference implementation of resilient HTTP client design; the reporting, alerting and scheduling layers work identically against any price source, and swapping the source means replacing one function (`fetch_price`).
+
+---
+
+## Engineering notes
+
+**Price parsing is the subtle part.** Amazon renders prices through several different elements depending on product type and layout. The selector chain is ordered most-precise-first: `a-offscreen` carries the complete screen-reader price (`$299.97`), while `a-price-whole` holds only the integer part (`299`).
+
+Reading the wrong one first silently truncates every price to whole dollars. Two consequences, and the second is the dangerous one:
+
+1. Every row in the history CSV is wrong by up to 99 cents, so any trend analysis built on it is quietly skewed.
+2. The truncation can cross a threshold. A $300.40 item parses as `300.0` and fires an alert against a $300.99 threshold it never actually met.
+
+`parse_price()` is isolated and unit-tested against each layout, with a named regression test asserting `a-offscreen` wins when both elements are present.
+
+**Failure isolation.** Each product is checked independently; an HTTP error, timeout or unparseable page is logged against that row and the run continues. One bad product never aborts a scheduled job.
+
+**Retry with backoff.** Three attempts per product with escalating delay, distinguishing HTTP errors, connection errors and timeouts so logs say what actually failed.
+
+**Credentials never touch the repo.** `SMTP_PASSWORD` is read from the environment; if it is unset the job logs a warning and completes rather than crashing. `config.json` holds only non-secret settings.
+
+**Append-only audit trail.** Every check appends a timestamped row — price, threshold, whether an alert fired, and any error — producing a dataset you can chart in pandas or Excel.
 
 ---
 
 ## Usage
 
 ```bash
-python price_tracker.py            # Run one check now
-python price_tracker.py --demo     # Simulated prices, no live requests
-python price_tracker.py --schedule # Loop on config.json interval
+python price_tracker.py --demo        # simulated prices, no requests
+python price_tracker.py              # single live check
+python price_tracker.py --schedule   # loop on config.json interval
 ```
 
----
+## Configuration
 
-## How it works
+`config.json`:
 
-1. Loads and validates `config.json`.
-2. For each product, fetches the page (rotating headers + jittered delays) and parses the price through a prioritized selector list.
-3. Appends results to the CSV history file.
-4. If any price is below its threshold, builds a single HTML alert email and sends it over SMTP/TLS.
-5. In `--schedule` mode, sleeps until the next interval and repeats.
+```json
+{
+  "products": [
+    { "name": "Anker PowerCore 10000", "url": "https://…", "threshold": 25.00 }
+  ],
+  "email": {
+    "smtp_server": "smtp.gmail.com",
+    "smtp_port": 587,
+    "sender_email": "you@gmail.com",
+    "recipients": ["you@gmail.com"]
+  },
+  "output_csv": "price_history.csv",
+  "check_interval_hours": 24
+}
+```
 
----
+Set the SMTP password out of band (Gmail requires an App Password):
 
-## Possible extensions
+```bash
+export SMTP_PASSWORD="your-app-password"
+```
 
-Swap CSV for SQLite or Postgres, add price-trend charts, support non-Amazon retailers via a pluggable parser, or trigger Slack/Telegram alerts instead of email.
+## Development
+
+```bash
+pip install -r requirements.txt
+pip install pytest ruff
+pytest -q      # 15 tests
+ruff check .
+```
+
+## Tech stack
+
+`Python` · `requests` · `BeautifulSoup` · `lxml` · `smtplib` (SMTP/TLS) · `csv` · `argparse` · `logging`
+
+## License
+
+MIT — see [LICENSE](LICENSE).
