@@ -20,6 +20,7 @@ Setup:
 """
 
 import os
+import re
 import csv
 import json
 import time
@@ -85,6 +86,46 @@ HEADERS_POOL = [
 
 
 # ---------------------------------------------------------------------------
+# Price parsing
+# ---------------------------------------------------------------------------
+# Ordered most-precise first. `a-offscreen` carries the full screen-reader
+# price ("$299.97"); `a-price-whole` holds only the integer part ("299"), so
+# reading it first silently truncated every price to whole dollars and could
+# fire a false alert on a $299.97 item with a $299.99 threshold.
+PRICE_SELECTORS = [
+    ("span", {"class": "a-offscreen"}),        # Screen-reader price: full value
+    ("span", {"id": "priceblock_ourprice"}),   # Older layout
+    ("span", {"id": "priceblock_dealprice"}),  # Deal / sale price
+    ("span", {"class": "a-price-whole"}),      # Last resort: whole dollars only
+]
+
+_PRICE_RE = re.compile(r"(\d[\d,]*(?:\.\d{1,2})?)")
+
+
+def parse_price(soup: BeautifulSoup) -> float | None:
+    """
+    Extract a product price from a parsed Amazon page.
+
+    Tries selectors in order of precision and returns the first value that
+    parses to a plausible price. Returns None if nothing usable is found.
+    """
+    for tag_name, attrs in PRICE_SELECTORS:
+        tag = soup.find(tag_name, attrs)
+        if not tag:
+            continue
+        match = _PRICE_RE.search(tag.get_text(strip=True))
+        if not match:
+            continue
+        try:
+            value = float(match.group(1).replace(",", ""))
+        except ValueError:
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Config loader
 # ---------------------------------------------------------------------------
 def load_config(path: Path = CONFIG_FILE) -> dict:
@@ -127,27 +168,7 @@ def fetch_price(url: str, retries: int = 3) -> dict:
             name_tag = soup.find("span", {"id": "productTitle"})
             name = name_tag.get_text(strip=True) if name_tag else "Unknown Product"
 
-            # --- Price: Amazon uses multiple selectors depending on product type ---
-            price = None
-            price_selectors = [
-                {"class": "a-price-whole"},       # Standard listing
-                {"id": "priceblock_ourprice"},     # Some older pages
-                {"id": "priceblock_dealprice"},    # Deal / sale price
-                {"class": "a-offscreen"},          # Screen-reader price (reliable)
-            ]
-            for selector in price_selectors:
-                tag = soup.find("span", selector)
-                if tag:
-                    raw = tag.get_text(strip=True)
-                    # Strip currency symbols, commas, and whitespace
-                    cleaned = raw.replace("$", "").replace(",", "").strip()
-                    # Remove trailing period left by .a-price-whole (e.g. "299.")
-                    cleaned = cleaned.rstrip(".")
-                    try:
-                        price = float(cleaned)
-                        break
-                    except ValueError:
-                        continue
+            price = parse_price(soup)
 
             return {"name": name, "price": price, "url": url, "error": None}
 
