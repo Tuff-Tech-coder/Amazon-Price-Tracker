@@ -44,7 +44,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("tracker.log"),
+        logging.FileHandler("tracker.log", encoding="utf-8"),
     ],
 )
 logger = logging.getLogger(__name__)
@@ -237,7 +237,7 @@ def send_alert_email(config: dict, alerts: list[dict]) -> None:
     smtp_password = os.environ.get("SMTP_PASSWORD")
     if not smtp_password:
         logger.warning(
-            "SMTP_PASSWORD environment variable not set — skipping email alert. "
+            "SMTP_PASSWORD environment variable not set - skipping email alert. "
             "Set it to enable email notifications."
         )
         return
@@ -317,7 +317,7 @@ def run_check(config: dict, demo: bool = False) -> None:
     logger.info(f"Starting price check for {len(config['products'])} products...")
 
     for product in config["products"]:
-        logger.info(f"Checking: {product['name']} — {product['url']}")
+        logger.info(f"Checking: {product['name']} - {product['url']}")
 
         result = fetch_price_demo(product) if demo else fetch_price(product["url"])
         threshold = product["threshold"]
@@ -351,7 +351,7 @@ def run_check(config: dict, demo: bool = False) -> None:
         logger.info(f"Sending email alert for {len(alerts)} product(s)...")
         send_alert_email(config, alerts)
     else:
-        logger.info("No prices dropped below thresholds — no alert sent.")
+        logger.info("No prices dropped below thresholds - no alert sent.")
 
     logger.info("Price check complete.")
 
