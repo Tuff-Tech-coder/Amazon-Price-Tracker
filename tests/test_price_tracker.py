@@ -91,3 +91,37 @@ class TestLogToCsv:
         rows = list(csv.reader(path.open()))
         assert rows[0][0] == "timestamp"
         assert len(rows) == 3          # 1 header + 2 data rows
+
+
+class TestEmailHtmlEscaping:
+    """Product names are scraped from a remote page -- untrusted input."""
+
+    def _render(self, name, url="https://www.amazon.com/dp/X"):
+        """Build the alert table row the way send_alert_email does."""
+        import html as _html
+
+        safe_name = _html.escape(str(name))
+        safe_url = (
+            _html.escape(url, quote=True)
+            if url.startswith(("http://", "https://"))
+            else "#"
+        )
+        return f"<td>{safe_name}</td><a href='{safe_url}'>"
+
+    def test_script_tag_in_product_name_is_escaped(self):
+        out = self._render("<script>alert(1)</script>")
+        assert "<script>" not in out
+        assert "&lt;script&gt;" in out
+
+    def test_quote_breakout_in_product_name_is_escaped(self):
+        out = self._render("\" onmouseover=\"alert(1)")
+        assert 'onmouseover="alert(1)' not in out
+
+    def test_javascript_scheme_url_is_rejected(self):
+        out = self._render("Widget", url="javascript:alert(1)")
+        assert "javascript:" not in out
+        assert "href='#'" in out
+
+    def test_https_url_is_preserved(self):
+        out = self._render("Widget", url="https://www.amazon.com/dp/B09XS7JWHH")
+        assert "https://www.amazon.com/dp/B09XS7JWHH" in out

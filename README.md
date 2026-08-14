@@ -1,7 +1,7 @@
 # Amazon Price Tracker
 
 ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-15%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-19%20passing-brightgreen)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 A scheduled monitoring service that tracks a configurable watchlist of products, logs every check to a timestamped CSV for trend analysis, and sends a formatted HTML email the moment a price drops below target.
@@ -83,7 +83,7 @@ export SMTP_PASSWORD="your-app-password"
 ```bash
 pip install -r requirements.txt
 pip install pytest ruff
-pytest -q      # 15 tests
+pytest -q      # 19 tests
 ruff check .
 ```
 

@@ -22,6 +22,7 @@ Setup:
 import argparse
 import csv
 import datetime
+import html
 import json
 import logging
 import os
@@ -245,17 +246,27 @@ def send_alert_email(config: dict, alerts: list[dict]) -> None:
     email_cfg = config["email"]
     subject = f"Price Alert: {len(alerts)} product(s) dropped below threshold!"
 
-    # Build HTML body
+    # Build HTML body.
+    #
+    # Product names are scraped from a remote page, so they are untrusted input:
+    # whoever controls that page controls this string. Interpolating it raw let
+    # a crafted title inject arbitrary markup into an email we then send to a
+    # recipient list. Every interpolated value is escaped, and the URL is
+    # additionally restricted to http(s) so a javascript: or data: scheme
+    # cannot end up in an href.
     rows_html = ""
     for item in alerts:
+        name = html.escape(str(item["name"]))
+        url = str(item["url"])
+        safe_url = html.escape(url, quote=True) if url.startswith(("http://", "https://")) else "#"
         rows_html += (
             f"<tr>"
-            f"<td style='padding:8px;border:1px solid #ddd'>{item['name']}</td>"
+            f"<td style='padding:8px;border:1px solid #ddd'>{name}</td>"
             f"<td style='padding:8px;border:1px solid #ddd;color:green'>"
             f"<strong>${item['price']:.2f}</strong></td>"
             f"<td style='padding:8px;border:1px solid #ddd'>${item['threshold']:.2f}</td>"
             f"<td style='padding:8px;border:1px solid #ddd'>"
-            f"<a href='{item['url']}'>View on Amazon</a></td>"
+            f"<a href='{safe_url}'>View on Amazon</a></td>"
             f"</tr>"
         )
 
