@@ -1,203 +1,363 @@
 """
 Amazon Price Tracker
 ====================
-Monitors Amazon product prices and sends email alerts when prices drop
-below user-defined thresholds. Results are logged to a CSV file with
-timestamps for trend analysis.
+Evaluates a product watchlist, records timestamped price checks, and previews
+or sends alerts when prices fall below user-defined targets. The default path
+is deterministic and offline.
 
 Usage:
-    python price_tracker.py                  # Run once immediately
-    python price_tracker.py --demo           # Run with simulated prices (no live requests)
-    python price_tracker.py --schedule       # Run on the configured interval
+    python price_tracker.py                  # Deterministic offline demo
+    python price_tracker.py --json-out run.json
+    python price_tracker.py --live-scrape    # Explicit legacy adapter opt-in
 
 Environment variables required for email alerts:
     SMTP_PASSWORD   Your Gmail app password (or SMTP provider password)
 
-Setup:
-    1. Copy .env.example to .env and fill in your SMTP password
-    2. Edit config.json to add your product URLs and thresholds
-    3. Run: python price_tracker.py
+For live email only, provide SMTP_PASSWORD through the process environment.
+The program intentionally does not load .env files.
 """
 
 import argparse
 import csv
-import datetime
+import datetime as dt
 import html
 import json
 import logging
+import math
 import os
-import random
 import re
 import smtplib
+import ssl
 import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 from bs4 import BeautifulSoup
 
-# ---------------------------------------------------------------------------
-# Logging setup — logs to both console and a rotating file
-# ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("tracker.log", encoding="utf-8"),
-    ],
-)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("price_tracker")
+logger.addHandler(logging.NullHandler())
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 CONFIG_FILE = Path(__file__).parent / "config.json"
-HEADERS_POOL = [
-    {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Accept": (
-            "text/html,application/xhtml+xml,application/xml;"
-            "q=0.9,image/avif,image/webp,*/*;q=0.8"
-        ),
-        "Connection": "keep-alive",
-        "Referer": "https://www.google.com/",
-        "DNT": "1",
-        "Upgrade-Insecure-Requests": "1",
-    },
-    {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-            "Version/17.4 Safari/605.1.15"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Connection": "keep-alive",
-        "Referer": "https://www.amazon.com/",
-    },
-]
+DEMO_FACTORS = (0.86, 1.08, 0.94, 1.11, 0.79)
+
+
+def configure_logging(log_file: Path | None = None) -> None:
+    """Configure console and rotating-file logging at runtime, not import time."""
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+    logger.addHandler(console)
+
+    if log_file is not None:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        rotating = RotatingFileHandler(
+            log_file,
+            maxBytes=1_000_000,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        rotating.setFormatter(formatter)
+        logger.addHandler(rotating)
 
 
 # ---------------------------------------------------------------------------
 # Price parsing
 # ---------------------------------------------------------------------------
-# Ordered most-precise first. `a-offscreen` carries the full screen-reader
-# price ("$299.97"); `a-price-whole` holds only the integer part ("299"), so
-# reading it first silently truncated every price to whole dollars and could
-# fire a false alert on a $299.97 item with a $299.99 threshold.
-PRICE_SELECTORS = [
-    ("span", {"class": "a-offscreen"}),        # Screen-reader price: full value
-    ("span", {"id": "priceblock_ourprice"}),   # Older layout
-    ("span", {"id": "priceblock_dealprice"}),  # Deal / sale price
-    ("span", {"class": "a-price-whole"}),      # Last resort: whole dollars only
-]
+# Amazon pages may expose several prices at once (list, deal, coupon, and
+# current offer). Prefer elements explicitly marked as the price-to-pay and
+# containers in the active product-price/buy-box area. A bare global
+# ``a-offscreen`` first match is unsafe because it can be a crossed-out list
+# price. Older single-price IDs remain supported after the modern selectors.
+PRICE_TEXT_SELECTORS = (
+    "#corePrice_feature_div .priceToPay .a-offscreen",
+    "#corePriceDisplay_desktop_feature_div .priceToPay .a-offscreen",
+    "#corePrice_desktop .priceToPay .a-offscreen",
+    "#apex_desktop .priceToPay .a-offscreen",
+    "#buybox .priceToPay .a-offscreen",
+    ".priceToPay .a-offscreen",
+    ".apexPriceToPay .a-offscreen",
+    "#priceblock_dealprice",
+    "#priceblock_ourprice",
+)
+
+PRICE_CONTAINER_SELECTORS = (
+    "#corePrice_feature_div .priceToPay",
+    "#corePriceDisplay_desktop_feature_div .priceToPay",
+    "#corePrice_desktop .priceToPay",
+    "#apex_desktop .priceToPay",
+    "#buybox .priceToPay",
+    ".priceToPay",
+    ".apexPriceToPay",
+)
+
+LIST_PRICE_CLASSES = {"a-text-price", "basisPrice", "priceBlockStrikePriceString"}
 
 _PRICE_RE = re.compile(r"(\d[\d,]*(?:\.\d{1,2})?)")
+
+
+def _parse_money_text(value: str) -> float | None:
+    match = _PRICE_RE.search(value)
+    if not match:
+        return None
+    try:
+        price = float(match.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    return price if math.isfinite(price) and price > 0 else None
+
+
+def _is_list_price(tag: Any) -> bool:
+    """Identify crossed-out/list-price markup surrounding a candidate."""
+    for ancestor in (tag, *tag.parents):
+        classes = set(ancestor.get("class", [])) if hasattr(ancestor, "get") else set()
+        if classes & LIST_PRICE_CLASSES:
+            return True
+        if ancestor.get("id") in {"priceblock_listprice", "listPrice"}:
+            return True
+    return False
+
+
+def _parse_split_price(container: Any) -> float | None:
+    """Combine Amazon's separate whole/fraction spans without truncation."""
+    whole_tag = container.select_one(".a-price-whole")
+    fraction_tag = container.select_one(".a-price-fraction")
+    if not whole_tag or not fraction_tag:
+        return None
+
+    whole = re.sub(r"[^\d,]", "", whole_tag.get_text(strip=True))
+    fraction = re.sub(r"\D", "", fraction_tag.get_text(strip=True))
+    if not whole or len(fraction) not in {1, 2}:
+        return None
+    return _parse_money_text(f"{whole}.{fraction.ljust(2, '0')}")
 
 
 def parse_price(soup: BeautifulSoup) -> float | None:
     """
     Extract a product price from a parsed Amazon page.
 
-    Tries selectors in order of precision and returns the first value that
-    parses to a plausible price. Returns None if nothing usable is found.
+    Prefer the active price-to-pay over list-price markup, then combine the
+    split whole/fraction representation when needed. Ambiguous global prices
+    and incomplete whole-dollar spans are rejected rather than guessed.
     """
-    for tag_name, attrs in PRICE_SELECTORS:
-        tag = soup.find(tag_name, attrs)
+    for selector in PRICE_TEXT_SELECTORS:
+        tag = soup.select_one(selector)
         if not tag:
             continue
-        match = _PRICE_RE.search(tag.get_text(strip=True))
-        if not match:
-            continue
-        try:
-            value = float(match.group(1).replace(",", ""))
-        except ValueError:
-            continue
-        if value > 0:
+        value = _parse_money_text(tag.get_text(strip=True))
+        if value is not None:
             return value
+
+    for selector in PRICE_CONTAINER_SELECTORS:
+        container = soup.select_one(selector)
+        if container:
+            value = _parse_split_price(container)
+            if value is not None:
+                return value
+
+    # A single non-list screen-reader price is safe as a compatibility
+    # fallback. If several remain, choosing one would be an ungrounded guess.
+    offscreen = [
+        tag for tag in soup.select("span.a-offscreen") if not _is_list_price(tag)
+    ]
+    if len(offscreen) == 1:
+        value = _parse_money_text(offscreen[0].get_text(strip=True))
+        if value is not None:
+            return value
+
+    split_candidates = []
+    for container in soup.select("span.a-price"):
+        if _is_list_price(container):
+            continue
+        value = _parse_split_price(container)
+        if value is not None:
+            split_candidates.append(value)
+    if len(split_candidates) == 1:
+        return split_candidates[0]
     return None
 
 
 # ---------------------------------------------------------------------------
 # Config loader
 # ---------------------------------------------------------------------------
-def load_config(path: Path = CONFIG_FILE) -> dict:
-    """Load and validate the JSON configuration file."""
+def _nonempty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def is_amazon_com_url(url: str) -> bool:
+    """Return whether a URL is a credential-free HTTPS Amazon.com URL."""
+    if not isinstance(url, str):
+        return False
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    return (
+        parsed.scheme.casefold() == "https"
+        and parsed.username is None
+        and parsed.password is None
+        and (host == "amazon.com" or host.endswith(".amazon.com"))
+    )
+
+
+def load_config(path: Path = CONFIG_FILE) -> dict[str, Any]:
+    """Load and validate configuration with product-specific errors."""
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
-    with open(path) as f:
-        config = json.load(f)
-    required_keys = ["products", "email", "output_csv"]
-    for key in required_keys:
+    try:
+        with path.open(encoding="utf-8") as handle:
+            config = json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in config file: {exc}") from exc
+
+    if not isinstance(config, dict):
+        raise ValueError("Config root must be a JSON object")
+    for key in ("products", "email", "output_csv"):
         if key not in config:
             raise ValueError(f"Missing required config key: '{key}'")
+
+    products = config["products"]
+    if not isinstance(products, list) or not products:
+        raise ValueError("'products' must be a non-empty list")
+    for index, product in enumerate(products, start=1):
+        if not isinstance(product, dict):
+            raise ValueError(f"Product {index} must be a JSON object")
+        for key in ("name", "url", "threshold"):
+            if key not in product:
+                raise ValueError(f"Product {index} is missing '{key}'")
+        if not _nonempty_string(product["name"]):
+            raise ValueError(f"Product {index} name must be a non-empty string")
+        if not _nonempty_string(product["url"]):
+            raise ValueError(f"Product {index} URL must be a non-empty string")
+        threshold = product["threshold"]
+        if (
+            isinstance(threshold, bool)
+            or not isinstance(threshold, (int, float))
+            or not math.isfinite(float(threshold))
+            or float(threshold) <= 0
+        ):
+            raise ValueError(f"Product {index} threshold must be a positive number")
+
+    if not isinstance(config["email"], dict):
+        raise ValueError("'email' must be a JSON object")
+    if not _nonempty_string(config["output_csv"]):
+        raise ValueError("'output_csv' must be a non-empty path string")
+    interval = config.get("check_interval_hours", 24)
+    if (
+        isinstance(interval, bool)
+        or not isinstance(interval, (int, float))
+        or not math.isfinite(float(interval))
+        or float(interval) <= 0
+    ):
+        raise ValueError("'check_interval_hours' must be a positive number")
     return config
 
 
 # ---------------------------------------------------------------------------
 # Price scraper
 # ---------------------------------------------------------------------------
-def fetch_price(url: str, retries: int = 3) -> dict:
+def fetch_price(url: str, retries: int = 3) -> dict[str, Any]:
+    """Use the explicitly enabled legacy HTML adapter for Amazon.com.
+
+    Requests are restricted to credential-free HTTPS Amazon.com URLs,
+    redirects are refused, and only transient failures are retried. New
+    integrations should use Amazon's supported Creators API instead.
     """
-    Scrape a product's name and price from Amazon.
+    if not is_amazon_com_url(url):
+        return {
+            "name": "Unknown",
+            "price": None,
+            "url": url,
+            "error": "Refused non-Amazon.com or non-HTTPS URL",
+        }
+    if retries < 1:
+        raise ValueError("retries must be at least 1")
 
-    Returns a dict with keys: name, price (float or None), url, error.
-    Rotates User-Agent headers and adds jitter between retries to reduce
-    the chance of being identified as a bot.
-    """
-    for attempt in range(1, retries + 1):
-        try:
-            headers = random.choice(HEADERS_POOL)
-            # Random delay 2-5 seconds — polite crawling
-            time.sleep(random.uniform(2, 5))
+    headers = {
+        "User-Agent": "PriceTrackerPortfolioDemo/1.0 (supported API recommended)",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    last_error = "All retries failed"
+    session = requests.Session()
+    try:
+        for attempt in range(1, retries + 1):
+            try:
+                response = session.get(
+                    url,
+                    headers=headers,
+                    timeout=(5, 15),
+                    allow_redirects=False,
+                )
+                if 300 <= response.status_code < 400:
+                    last_error = "Redirect refused by the legacy safety guard"
+                    break
+                response.raise_for_status()
+                soup = BeautifulSoup(response.text, "lxml")
+                name_tag = soup.find("span", {"id": "productTitle"})
+                name = name_tag.get_text(strip=True) if name_tag else "Unknown Product"
+                price = parse_price(soup)
+                if price is None:
+                    return {
+                        "name": name,
+                        "price": None,
+                        "url": url,
+                        "error": "Price not found in response",
+                    }
+                return {"name": name, "price": price, "url": url, "error": None}
+            except requests.exceptions.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else None
+                last_error = f"HTTP {status or 'error'}"
+                logger.warning(
+                    "HTTP error on attempt %s/%s for %s: %s",
+                    attempt,
+                    retries,
+                    url,
+                    exc,
+                )
+                if status not in {429, 500, 502, 503, 504}:
+                    break
+            except requests.exceptions.ConnectionError as exc:
+                last_error = f"Connection error: {exc}"
+                logger.warning("Connection error on attempt %s/%s", attempt, retries)
+            except requests.exceptions.Timeout:
+                last_error = "Request timed out"
+                logger.warning("Timeout on attempt %s/%s for %s", attempt, retries, url)
+            except requests.exceptions.RequestException as exc:
+                last_error = f"Request failed: {exc}"
+                logger.warning("Request error on attempt %s/%s: %s", attempt, retries, exc)
+                break
 
-            session = requests.Session()
-            response = session.get(url, headers=headers, timeout=15)
-            response.raise_for_status()
+            if attempt < retries:
+                backoff = min(2 ** (attempt - 1), 8)
+                logger.info("Waiting %ss before retry", backoff)
+                time.sleep(backoff)
+    finally:
+        session.close()
 
-            soup = BeautifulSoup(response.text, "lxml")
-
-            # --- Product name ---
-            name_tag = soup.find("span", {"id": "productTitle"})
-            name = name_tag.get_text(strip=True) if name_tag else "Unknown Product"
-
-            price = parse_price(soup)
-
-            return {"name": name, "price": price, "url": url, "error": None}
-
-        except requests.exceptions.HTTPError as e:
-            logger.warning(f"HTTP error on attempt {attempt}/{retries} for {url}: {e}")
-        except requests.exceptions.ConnectionError as e:
-            logger.warning(f"Connection error on attempt {attempt}/{retries}: {e}")
-        except requests.exceptions.Timeout:
-            logger.warning(f"Timeout on attempt {attempt}/{retries} for {url}")
-        except Exception as e:
-            logger.warning(f"Unexpected error on attempt {attempt}/{retries}: {e}")
-
-        if attempt < retries:
-            backoff = 5 * attempt
-            logger.info(f"Waiting {backoff}s before retry...")
-            time.sleep(backoff)
-
-    return {"name": "Unknown", "price": None, "url": url, "error": "All retries failed"}
+    return {"name": "Unknown", "price": None, "url": url, "error": last_error}
 
 
-def fetch_price_demo(product: dict) -> dict:
-    """
-    Simulate a price fetch for demo/testing without making live requests.
-    Generates a realistic price slightly above or below the threshold.
-    """
-    base = product["threshold"]
-    # Randomly simulate either a drop below threshold or a price just above
-    simulated_price = round(random.uniform(base * 0.80, base * 1.15), 2)
+def fetch_price_demo(
+    product: dict[str, Any], index: int = 0, seed: int = 42
+) -> dict[str, Any]:
+    """Simulate a deterministic price without making a network request."""
+    factor = DEMO_FACTORS[(index + seed) % len(DEMO_FACTORS)]
+    simulated_price = round(float(product["threshold"]) * factor, 2)
     return {
         "name": product["name"],
         "price": simulated_price,
@@ -209,141 +369,191 @@ def fetch_price_demo(product: dict) -> dict:
 # ---------------------------------------------------------------------------
 # CSV logger
 # ---------------------------------------------------------------------------
-def log_to_csv(csv_path: str, records: list[dict]) -> None:
-    """
-    Append price check results to a CSV file.
-    Creates the file with a header row if it does not exist.
-    """
+def _csv_safe(value: Any) -> Any:
+    """Neutralize formulas in remote text before users open the CSV."""
+    if not isinstance(value, str):
+        return value
+    if value.lstrip().startswith(("=", "+", "-", "@", "\t", "\r")):
+        return "'" + value
+    return value
+
+
+def log_to_csv(csv_path: str | Path, records: list[dict[str, Any]]) -> None:
+    """Append records safely, creating parent folders and empty-file headers."""
     fieldnames = ["timestamp", "name", "price", "threshold", "alert_triggered", "url", "error"]
     path = Path(csv_path)
-    write_header = not path.exists()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists() or path.stat().st_size == 0
 
-    with open(path, "a", newline="", encoding="utf-8") as f:
+    safe_records = []
+    for record in records:
+        safe_records.append({
+            key: _csv_safe(record.get(key)) if key in {"name", "url", "error"}
+            else record.get(key)
+            for key in fieldnames
+        })
+
+    with path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         if write_header:
             writer.writeheader()
-        writer.writerows(records)
+        writer.writerows(safe_records)
 
-    logger.info(f"Logged {len(records)} records to {csv_path}")
+    logger.info("Logged %s records to %s", len(records), path)
 
 
 # ---------------------------------------------------------------------------
 # Email alerts
 # ---------------------------------------------------------------------------
-def send_alert_email(config: dict, alerts: list[dict]) -> None:
-    """
-    Send an HTML email listing all products whose prices dropped below threshold.
-    Reads the SMTP password from the SMTP_PASSWORD environment variable.
-    """
-    smtp_password = os.environ.get("SMTP_PASSWORD")
-    if not smtp_password:
-        logger.warning(
-            "SMTP_PASSWORD environment variable not set - skipping email alert. "
-            "Set it to enable email notifications."
-        )
-        return
+def _safe_amazon_link(url: Any) -> str:
+    value = str(url)
+    return html.escape(value, quote=True) if is_amazon_com_url(value) else "#"
 
+
+def build_alert_message(
+    config: dict[str, Any], alerts: list[dict[str, Any]]
+) -> MIMEMultipart:
+    """Build a multipart alert without sending it, enabling direct tests."""
     email_cfg = config["email"]
-    subject = f"Price Alert: {len(alerts)} product(s) dropped below threshold!"
+    missing = [key for key in ("sender_email", "recipients") if key not in email_cfg]
+    if missing:
+        raise ValueError(f"Missing email config field(s): {', '.join(missing)}")
+    sender = email_cfg["sender_email"]
+    recipients = email_cfg["recipients"]
+    if not _nonempty_string(sender) or "\n" in sender or "\r" in sender:
+        raise ValueError("sender_email must be a safe, non-empty string")
+    if not isinstance(recipients, list) or not recipients:
+        raise ValueError("recipients must be a non-empty list")
+    if any(not _nonempty_string(item) or "\n" in item or "\r" in item for item in recipients):
+        raise ValueError("recipients contains an unsafe or empty address")
 
-    # Build HTML body.
-    #
-    # Product names are scraped from a remote page, so they are untrusted input:
-    # whoever controls that page controls this string. Interpolating it raw let
-    # a crafted title inject arbitrary markup into an email we then send to a
-    # recipient list. Every interpolated value is escaped, and the URL is
-    # additionally restricted to http(s) so a javascript: or data: scheme
-    # cannot end up in an href.
-    rows_html = ""
+    rows_html = []
+    plain_rows = []
     for item in alerts:
         name = html.escape(str(item["name"]))
-        url = str(item["url"])
-        safe_url = html.escape(url, quote=True) if url.startswith(("http://", "https://")) else "#"
-        rows_html += (
-            f"<tr>"
+        safe_url = _safe_amazon_link(item["url"])
+        price = float(item["price"])
+        threshold = float(item["threshold"])
+        rows_html.append(
+            "<tr>"
             f"<td style='padding:8px;border:1px solid #ddd'>{name}</td>"
-            f"<td style='padding:8px;border:1px solid #ddd;color:green'>"
-            f"<strong>${item['price']:.2f}</strong></td>"
-            f"<td style='padding:8px;border:1px solid #ddd'>${item['threshold']:.2f}</td>"
+            f"<td style='padding:8px;border:1px solid #ddd;color:#08783e'>"
+            f"<strong>${price:.2f}</strong></td>"
+            f"<td style='padding:8px;border:1px solid #ddd'>${threshold:.2f}</td>"
             f"<td style='padding:8px;border:1px solid #ddd'>"
-            f"<a href='{safe_url}'>View on Amazon</a></td>"
-            f"</tr>"
+            f"<a href='{safe_url}'>View product</a></td></tr>"
         )
+        plain_rows.append(f"- {item['name']}: ${price:.2f} (target ${threshold:.2f})")
 
-    body = f"""
-    <html><body>
-    <h2 style="color:#e47911;">Amazon Price Alert</h2>
-    <p>The following products have dropped below your target prices:</p>
-    <table style="border-collapse:collapse;width:100%">
-      <tr style="background:#e47911;color:white">
-        <th style="padding:8px;text-align:left">Product</th>
-        <th style="padding:8px;text-align:left">Current Price</th>
-        <th style="padding:8px;text-align:left">Your Threshold</th>
-        <th style="padding:8px;text-align:left">Link</th>
-      </tr>
-      {rows_html}
-    </table>
-    <p style="color:#888;font-size:12px">Sent by Amazon Price Tracker</p>
-    </body></html>
-    """
+    body = (
+        "<html><body><h2 style='color:#d86f00'>Price Alert</h2>"
+        "<p>The following monitored products are below their target prices:</p>"
+        "<table style='border-collapse:collapse;width:100%'>"
+        "<tr style='background:#26364a;color:white'>"
+        "<th style='padding:8px;text-align:left'>Product</th>"
+        "<th style='padding:8px;text-align:left'>Current Price</th>"
+        "<th style='padding:8px;text-align:left'>Target</th>"
+        "<th style='padding:8px;text-align:left'>Link</th></tr>"
+        + "".join(rows_html)
+        + "</table><p style='color:#777;font-size:12px'>Sent by Price Tracker</p>"
+        "</body></html>"
+    )
+    plain = "Price alert\n\n" + "\n".join(plain_rows)
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = email_cfg["sender_email"]
-    msg["To"] = ", ".join(email_cfg["recipients"])
-    msg.attach(MIMEText(body, "html"))
+    message = MIMEMultipart("alternative")
+    message["Subject"] = f"Price Alert: {len(alerts)} product(s) below target"
+    message["From"] = sender
+    message["To"] = ", ".join(recipients)
+    message.attach(MIMEText(plain, "plain", "utf-8"))
+    message.attach(MIMEText(body, "html", "utf-8"))
+    return message
+
+
+def send_alert_email(config: dict[str, Any], alerts: list[dict[str, Any]]) -> bool:
+    """Send an alert through verified TLS and report delivery success."""
+    smtp_password = os.environ.get("SMTP_PASSWORD")
+    if not smtp_password:
+        logger.warning("SMTP_PASSWORD is not set; email alert skipped")
+        return False
 
     try:
-        with smtplib.SMTP(email_cfg["smtp_server"], email_cfg["smtp_port"]) as server:
+        email_cfg = config["email"]
+        for key in ("smtp_server", "smtp_port"):
+            if key not in email_cfg:
+                raise ValueError(f"Missing email config field: '{key}'")
+        smtp_port = int(email_cfg["smtp_port"])
+        message = build_alert_message(config, alerts)
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.error("Invalid email configuration: %s", exc)
+        return False
+
+    try:
+        with smtplib.SMTP(
+            email_cfg["smtp_server"],
+            smtp_port,
+            timeout=30,
+        ) as server:
             server.ehlo()
-            server.starttls()
+            server.starttls(context=ssl.create_default_context())
+            server.ehlo()
             server.login(email_cfg["sender_email"], smtp_password)
             server.sendmail(
                 email_cfg["sender_email"],
                 email_cfg["recipients"],
-                msg.as_string(),
+                message.as_string(),
             )
-        logger.info(f"Alert email sent to: {', '.join(email_cfg['recipients'])}")
+        logger.info("Alert email sent to: %s", ", ".join(email_cfg["recipients"]))
+        return True
     except smtplib.SMTPAuthenticationError:
-        logger.error(
-            "SMTP authentication failed. For Gmail, use an App Password "
-            "(myaccount.google.com → Security → App passwords)."
-        )
-    except Exception as e:
-        logger.error(f"Failed to send email: {e}")
+        logger.error("SMTP authentication failed; verify the provider app password")
+    except (OSError, smtplib.SMTPException, ValueError) as exc:
+        logger.error("Failed to send email: %s", exc)
+    return False
 
 
 # ---------------------------------------------------------------------------
 # Main check loop
 # ---------------------------------------------------------------------------
-def run_check(config: dict, demo: bool = False) -> None:
-    """
-    Check all configured products once and log results.
-    Triggers email alerts for any products below their threshold.
-    """
-    timestamp = datetime.datetime.now().isoformat(timespec="seconds")
-    records = []
-    alerts = []
+def run_check(
+    config: dict[str, Any],
+    *,
+    demo: bool = True,
+    seed: int = 42,
+    send_email: bool = True,
+    checked_at: dt.datetime | None = None,
+) -> dict[str, Any]:
+    """Check the watchlist once, persist records, and return a run summary."""
+    now = checked_at or dt.datetime.now(dt.UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=dt.UTC)
+    timestamp = now.astimezone(dt.UTC).isoformat(timespec="seconds")
+    records: list[dict[str, Any]] = []
+    alerts: list[dict[str, Any]] = []
 
-    logger.info(f"Starting price check for {len(config['products'])} products...")
+    logger.info(
+        "Starting %s price check for %s products",
+        "demo" if demo else "live",
+        len(config["products"]),
+    )
 
-    for product in config["products"]:
-        logger.info(f"Checking: {product['name']} - {product['url']}")
-
-        result = fetch_price_demo(product) if demo else fetch_price(product["url"])
-        threshold = product["threshold"]
+    for index, product in enumerate(config["products"]):
+        logger.info("Checking: %s", product["name"])
+        result = (
+            fetch_price_demo(product, index=index, seed=seed)
+            if demo
+            else fetch_price(product["url"])
+        )
+        threshold = float(product["threshold"])
         price = result["price"]
         alert_triggered = False
 
         if result["error"]:
-            logger.error(f"  Error: {result['error']}")
-        elif price is None:
-            logger.warning("  Could not parse price from page")
-        else:
-            logger.info(f"  Price: ${price:.2f} (threshold: ${threshold:.2f})")
+            logger.error("  Error: %s", result["error"])
+        elif price is not None:
+            logger.info("  Price: $%.2f (target: $%.2f)", price, threshold)
             if price < threshold:
                 alert_triggered = True
-                logger.info("  *** ALERT: Price dropped below threshold! ***")
+                logger.info("  ALERT: Price is below target")
                 alerts.append({**result, "threshold": threshold})
 
         records.append({
@@ -358,24 +568,55 @@ def run_check(config: dict, demo: bool = False) -> None:
 
     log_to_csv(config["output_csv"], records)
 
-    if alerts:
-        logger.info(f"Sending email alert for {len(alerts)} product(s)...")
-        send_alert_email(config, alerts)
+    email_sent = False
+    if alerts and demo:
+        logger.info(
+            "Demo mode: %s alert(s) previewed; SMTP is always suppressed",
+            len(alerts),
+        )
+    elif alerts and send_email:
+        email_sent = send_alert_email(config, alerts)
     else:
-        logger.info("No prices dropped below thresholds - no alert sent.")
+        logger.info("No email alert required")
 
-    logger.info("Price check complete.")
+    summary = {
+        "checked_at": timestamp,
+        "mode": "demo" if demo else "legacy-live-scrape",
+        "products_checked": len(records),
+        "alerts_triggered": len(alerts),
+        "email_sent": email_sent,
+        "records": records,
+    }
+    logger.info(
+        "Price check complete: %s checked, %s below target",
+        len(records),
+        len(alerts),
+    )
+    return summary
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(description="Amazon Price Tracker")
-    parser.add_argument(
-        "--demo",
+def write_json_summary(destination: str | Path, summary: dict[str, Any]) -> None:
+    """Write a structured run artifact, creating parent folders as needed."""
+    path = Path(destination)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, ensure_ascii=False)
+    logger.info("Wrote run summary to %s", path)
+
+
+def _resolve_output_path(value: str, config_path: Path) -> str:
+    path = Path(value)
+    return str(path if path.is_absolute() else config_path.parent / path)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Demo-first product price tracker")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--demo", action="store_true", help="Explicit offline demo (the default)")
+    mode.add_argument(
+        "--live-scrape",
         action="store_true",
-        help="Run with simulated prices (no live HTTP requests)",
+        help="Enable the legacy Amazon.com HTML adapter; Creators API is recommended",
     )
     parser.add_argument(
         "--schedule",
@@ -387,21 +628,49 @@ def main():
         default=str(CONFIG_FILE),
         help="Path to config JSON file (default: config.json)",
     )
-    args = parser.parse_args()
+    parser.add_argument("--output-csv", help="Override the configured CSV destination")
+    parser.add_argument("--json-out", help="Write the latest structured run summary")
+    parser.add_argument("--seed", type=int, default=42, help="Deterministic demo scenario seed")
+    args = parser.parse_args(argv)
 
-    config = load_config(Path(args.config))
+    config_path = Path(args.config).resolve()
+    try:
+        config = load_config(config_path)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+
+    configured_output = args.output_csv or config["output_csv"]
+    config["output_csv"] = _resolve_output_path(configured_output, config_path)
+    configure_logging(config_path.parent / "tracker.log")
+
+    demo = not args.live_scrape
+    if args.live_scrape:
+        logger.warning(
+            "Legacy live scraping explicitly enabled. "
+            "Amazon's supported integration is the Creators API."
+        )
+
+    def execute_once() -> dict[str, Any]:
+        summary = run_check(config, demo=demo, seed=args.seed)
+        if args.json_out:
+            write_json_summary(args.json_out, summary)
+        return summary
 
     if args.schedule:
-        interval_hours = config.get("check_interval_hours", 24)
-        logger.info(f"Scheduler mode: checking every {interval_hours} hour(s).")
-        while True:
-            run_check(config, demo=args.demo)
-            next_check = datetime.datetime.now() + datetime.timedelta(hours=interval_hours)
-            logger.info(f"Next check at {next_check.strftime('%Y-%m-%d %H:%M:%S')}")
-            time.sleep(interval_hours * 3600)
+        interval_hours = float(config.get("check_interval_hours", 24))
+        logger.info("Scheduler mode: checking every %s hour(s)", interval_hours)
+        try:
+            while True:
+                execute_once()
+                next_check = dt.datetime.now().astimezone() + dt.timedelta(hours=interval_hours)
+                logger.info("Next check at %s", next_check.isoformat(timespec="seconds"))
+                time.sleep(interval_hours * 3600)
+        except KeyboardInterrupt:
+            logger.info("Scheduler stopped by user")
     else:
-        run_check(config, demo=args.demo)
+        execute_once()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
